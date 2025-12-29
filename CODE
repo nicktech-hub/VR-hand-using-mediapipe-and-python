@@ -1,0 +1,718 @@
+"""
+MediaPipe Hand Tracking + Panda3D Robotic Hand Visualizer
+Simple, working procedural hand with no external models needed
+"""
+
+import cv2
+import mediapipe as mp
+from panda3d.core import *
+from direct.showbase.ShowBase import ShowBase
+from direct.task import Task
+import numpy as np
+import threading
+
+# MediaPipe Hand connections for drawing
+HAND_CONNECTIONS = [
+    (0, 1), (1, 2), (2, 3), (3, 4),  # Thumb
+    (0, 5), (5, 6), (6, 7), (7, 8),  # Index
+    (0, 9), (9, 10), (10, 11), (11, 12),  # Middle
+    (0, 13), (13, 14), (14, 15), (15, 16),  # Ring
+    (0, 17), (17, 18), (18, 19), (19, 20),  # Pinky
+    (5, 9), (9, 13), (13, 17)  # Palm
+]
+
+class HandTracker:
+    """Handles MediaPipe hand tracking for both hands"""
+    def __init__(self):
+        self.mp_hands = mp.solutions.hands
+        self.hands = self.mp_hands.Hands(
+            static_image_mode=False,
+            max_num_hands=2,  # Track both hands
+            min_detection_confidence=0.5,
+            min_tracking_confidence=0.5
+        )
+        self.mp_draw = mp.solutions.drawing_utils
+        self.left_hand_landmarks = None
+        self.right_hand_landmarks = None
+        
+    def process_frame(self, frame):
+        """Process camera frame and extract hand landmarks for both hands"""
+        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        results = self.hands.process(frame_rgb)
+        
+        # Reset landmarks
+        self.left_hand_landmarks = None
+        self.right_hand_landmarks = None
+        
+        if results.multi_hand_landmarks and results.multi_handedness:
+            for hand_landmarks, handedness in zip(results.multi_hand_landmarks, results.multi_handedness):
+                # Determine if left or right hand
+                label = handedness.classification[0].label
+                
+                if label == "Left":
+                    self.left_hand_landmarks = hand_landmarks
+                else:  # "Right"
+                    self.right_hand_landmarks = hand_landmarks
+                
+                # Draw landmarks on frame
+                self.mp_draw.draw_landmarks(
+                    frame, hand_landmarks, self.mp_hands.HAND_CONNECTIONS
+                )
+        
+        return frame
+
+class RoboticHand3D(ShowBase):
+    """Panda3D visualization of robotic hands (left and right)"""
+    def __init__(self, hand_tracker):
+        ShowBase.__init__(self)
+        self.hand_tracker = hand_tracker
+        
+        # Camera setup - positioned to see both hands
+        self.cam.setPos(0, -40, 15)
+        self.cam.lookAt(0, 0, 5)
+        
+        # Lighting
+        self.setup_lighting()
+        
+        # Better background - gradient blue-gray for contrast
+        self.setBackgroundColor(0.15, 0.18, 0.25, 1)
+        
+        # Create two robotic hands - left and right
+        self.left_hand_joints = []
+        self.left_hand_bones = []
+        self.right_hand_joints = []
+        self.right_hand_bones = []
+        
+        # Create left hand
+        self.joint_nodes = self.left_hand_joints
+        self.bone_nodes = self.left_hand_bones
+        self.create_robotic_hand()
+        
+        # Create right hand
+        self.joint_nodes = self.right_hand_joints
+        self.bone_nodes = self.right_hand_bones
+        self.create_robotic_hand()
+        
+        # Add reference grid
+        self.create_grid()
+        
+        # Smoothing for realistic movement
+        self.left_prev_positions = [None] * 21
+        self.right_prev_positions = [None] * 21
+        self.smoothing_factor = 0.35
+        
+        # Update task
+        self.taskMgr.add(self.update_hand, "UpdateHandTask")
+        
+    def setup_lighting(self):
+        """Setup scene lighting for realistic robot appearance"""
+        # Stronger ambient light for better visibility
+        alight = AmbientLight('alight')
+        alight.setColor((0.4, 0.4, 0.45, 1))
+        alnp = self.render.attachNewNode(alight)
+        self.render.setLight(alnp)
+        
+        # Main directional light (brighter cool white)
+        dlight = DirectionalLight('dlight')
+        dlight.setColor((1.2, 1.2, 1.3, 1))
+        dlnp = self.render.attachNewNode(dlight)
+        dlnp.setHpr(45, -45, 0)
+        self.render.setLight(dlnp)
+        
+        # Rim light (brighter warm accent from behind)
+        rim_light = DirectionalLight('rim_light')
+        rim_light.setColor((0.6, 0.55, 0.5, 1))
+        rim_np = self.render.attachNewNode(rim_light)
+        rim_np.setHpr(-135, -30, 0)
+        self.render.setLight(rim_np)
+        
+        # Fill light (brighter from below)
+        fill_light = PointLight('fill_light')
+        fill_light.setColor((0.5, 0.5, 0.55, 1))
+        fill_np = self.render.attachNewNode(fill_light)
+        fill_np.setPos(0, 0, -10)
+        self.render.setLight(fill_np)
+        
+        # Additional front light for clarity
+        front_light = PointLight('front_light')
+        front_light.setColor((0.6, 0.6, 0.65, 1))
+        front_np = self.render.attachNewNode(front_light)
+        front_np.setPos(0, -30, 10)
+        self.render.setLight(front_np)
+        
+    def create_box(self, width, height, depth, color=(0.2, 0.2, 0.2, 1)):
+        """Create a box/block for robotic components with beveled edges"""
+        from panda3d.core import GeomVertexFormat, GeomVertexData, Geom, GeomTriangles, GeomNode
+        from panda3d.core import GeomVertexWriter
+        
+        vformat = GeomVertexFormat.getV3n3c4()
+        vdata = GeomVertexData('box', vformat, Geom.UHStatic)
+        
+        vertex = GeomVertexWriter(vdata, 'vertex')
+        normal = GeomVertexWriter(vdata, 'normal')
+        vcolor = GeomVertexWriter(vdata, 'color')
+        
+        # Slight bevel for realistic edges
+        bevel = 0.02
+        w, h, d = width/2 - bevel, height/2 - bevel, depth/2 - bevel
+        
+        # Define 8 vertices of the box
+        vertices = [
+            (-w, -h, -d), (w, -h, -d), (w, h, -d), (-w, h, -d),  # Bottom
+            (-w, -h, d), (w, -h, d), (w, h, d), (-w, h, d)       # Top
+        ]
+        
+        # Define faces with normals
+        faces = [
+            # Bottom face (z = -d)
+            [(0, 1, 2, 3), (0, 0, -1)],
+            # Top face (z = d)
+            [(4, 7, 6, 5), (0, 0, 1)],
+            # Front face (y = -h)
+            [(0, 4, 5, 1), (0, -1, 0)],
+            # Back face (y = h)
+            [(2, 6, 7, 3), (0, 1, 0)],
+            # Left face (x = -w)
+            [(0, 3, 7, 4), (-1, 0, 0)],
+            # Right face (x = w)
+            [(1, 5, 6, 2), (1, 0, 0)]
+        ]
+        
+        prim = GeomTriangles(Geom.UHStatic)
+        
+        for face_indices, norm in faces:
+            base_idx = len([v for v in range(vertex.getWriteRow())])
+            for idx in face_indices:
+                vertex.addData3(*vertices[idx])
+                normal.addData3(*norm)
+                # Slight color variation per face for depth
+                face_color = (
+                    color[0] * (0.9 + norm[2] * 0.1),
+                    color[1] * (0.9 + norm[2] * 0.1),
+                    color[2] * (0.9 + norm[2] * 0.1),
+                    color[3]
+                )
+                vcolor.addData4(*face_color)
+            
+            # Two triangles per face
+            prim.addVertices(base_idx, base_idx + 1, base_idx + 2)
+            prim.addVertices(base_idx, base_idx + 2, base_idx + 3)
+        
+        geom = Geom(vdata)
+        geom.addPrimitive(prim)
+        node = GeomNode('box')
+        node.addGeom(geom)
+        
+        box_np = self.render.attachNewNode(node)
+        
+        # Enhanced material with better metallic properties
+        mat = Material()
+        mat.setShininess(64)
+        mat.setSpecular((0.8, 0.8, 0.85, 1))
+        mat.setMetallic(0.7)
+        mat.setRoughness(0.4)
+        mat.setAmbient(color)
+        mat.setDiffuse(color)
+        box_np.setMaterial(mat)
+        
+        return box_np
+    
+    def create_sphere_joint(self, radius=0.3, color=(0.2, 0.6, 0.9, 1), joint_type='normal'):
+        """Create a sphere for joint visualization"""
+        from panda3d.core import GeomVertexFormat, GeomVertexData, Geom, GeomTriangles, GeomNode
+        from panda3d.core import GeomVertexWriter
+        
+        vformat = GeomVertexFormat.getV3n3c4()
+        vdata = GeomVertexData('sphere', vformat, Geom.UHStatic)
+        
+        vertex = GeomVertexWriter(vdata, 'vertex')
+        normal = GeomVertexWriter(vdata, 'normal')
+        vcolor = GeomVertexWriter(vdata, 'color')
+        
+        # Simple sphere approximation
+        segments = 16
+        rings = 12
+        
+        for ring in range(rings + 1):
+            theta = ring * 3.14159 / rings
+            for seg in range(segments + 1):
+                phi = seg * 2 * 3.14159 / segments
+                
+                x = radius * np.sin(theta) * np.cos(phi)
+                y = radius * np.sin(theta) * np.sin(phi)
+                z = radius * np.cos(theta)
+                
+                vertex.addData3(x, y, z)
+                normal.addData3(x/radius, y/radius, z/radius)
+                vcolor.addData4(*color)
+        
+        prim = GeomTriangles(Geom.UHStatic)
+        for ring in range(rings):
+            for seg in range(segments):
+                i0 = ring * (segments + 1) + seg
+                i1 = i0 + 1
+                i2 = (ring + 1) * (segments + 1) + seg
+                i3 = i2 + 1
+                
+                prim.addVertices(i0, i2, i1)
+                prim.addVertices(i1, i2, i3)
+        
+        geom = Geom(vdata)
+        geom.addPrimitive(prim)
+        node = GeomNode('sphere')
+        node.addGeom(geom)
+        
+        sphere_np = self.render.attachNewNode(node)
+        
+        # Enhanced metallic material for joints
+        mat = Material()
+        mat.setShininess(200)  # Very shiny
+        mat.setSpecular((1, 1, 1, 1))
+        mat.setMetallic(0.9)
+        mat.setRoughness(0.2)
+        mat.setAmbient(color)
+        mat.setDiffuse(color)
+        sphere_np.setMaterial(mat)
+        
+        # Add rim lighting effect for mechanical look
+        if joint_type == 'knuckle':
+            sphere_np.setScale(1.2, 1.2, 0.8)  # Flatter for knuckles
+        
+        return sphere_np
+        """Create a sphere for joint visualization"""
+        from panda3d.core import GeomVertexFormat, GeomVertexData, Geom, GeomTriangles, GeomNode
+        from panda3d.core import GeomVertexWriter
+        
+        vformat = GeomVertexFormat.getV3n3c4()
+        vdata = GeomVertexData('sphere', vformat, Geom.UHStatic)
+        
+        vertex = GeomVertexWriter(vdata, 'vertex')
+        normal = GeomVertexWriter(vdata, 'normal')
+        vcolor = GeomVertexWriter(vdata, 'color')
+        
+        # Simple sphere approximation
+        segments = 16
+        rings = 12
+        
+        for ring in range(rings + 1):
+            theta = ring * 3.14159 / rings
+            for seg in range(segments + 1):
+                phi = seg * 2 * 3.14159 / segments
+                
+                x = radius * np.sin(theta) * np.cos(phi)
+                y = radius * np.sin(theta) * np.sin(phi)
+                z = radius * np.cos(theta)
+                
+                vertex.addData3(x, y, z)
+                normal.addData3(x/radius, y/radius, z/radius)
+                vcolor.addData4(*color)
+        
+        prim = GeomTriangles(Geom.UHStatic)
+        for ring in range(rings):
+            for seg in range(segments):
+                i0 = ring * (segments + 1) + seg
+                i1 = i0 + 1
+                i2 = (ring + 1) * (segments + 1) + seg
+                i3 = i2 + 1
+                
+                prim.addVertices(i0, i2, i1)
+                prim.addVertices(i1, i2, i3)
+        
+        geom = Geom(vdata)
+        geom.addPrimitive(prim)
+        node = GeomNode('sphere')
+        node.addGeom(geom)
+        
+        sphere_np = self.render.attachNewNode(node)
+        
+        # Add metallic material
+        mat = Material()
+        mat.setShininess(128)
+        mat.setSpecular((1, 1, 1, 1))
+        mat.setAmbient(color)
+        mat.setDiffuse(color)
+        sphere_np.setMaterial(mat)
+        
+        # Add rim lighting effect for mechanical look
+        if joint_type == 'knuckle':
+            sphere_np.setScale(1.2, 1.2, 0.8)  # Flatter for knuckles
+        
+        return sphere_np
+        
+    def create_cylinder_bone(self, length=1.0, radius=0.15, color=(0.5, 0.5, 0.5, 1), segments=16):
+        """Create a cylinder for bone visualization with better detail"""
+        from panda3d.core import GeomVertexFormat, GeomVertexData, Geom, GeomTriangles, GeomNode
+        from panda3d.core import GeomVertexWriter
+        
+        vformat = GeomVertexFormat.getV3n3c4()
+        vdata = GeomVertexData('cylinder', vformat, Geom.UHStatic)
+        
+        vertex = GeomVertexWriter(vdata, 'vertex')
+        normal = GeomVertexWriter(vdata, 'normal')
+        vcolor = GeomVertexWriter(vdata, 'color')
+        
+        # Create cylinder vertices
+        for i in range(2):
+            z = i * length
+            for seg in range(segments + 1):
+                angle = seg * 2 * 3.14159 / segments
+                x = radius * np.cos(angle)
+                y = radius * np.sin(angle)
+                
+                vertex.addData3(x, y, z)
+                normal.addData3(x/radius, y/radius, 0)
+                vcolor.addData4(*color)
+        
+        prim = GeomTriangles(Geom.UHStatic)
+        for seg in range(segments):
+            i0 = seg
+            i1 = seg + 1
+            i2 = seg + segments + 1
+            i3 = seg + segments + 2
+            
+            prim.addVertices(i0, i2, i1)
+            prim.addVertices(i1, i2, i3)
+        
+        geom = Geom(vdata)
+        geom.addPrimitive(prim)
+        node = GeomNode('cylinder')
+        node.addGeom(geom)
+        
+        cylinder_np = self.render.attachNewNode(node)
+        
+        # Enhanced metallic material for bones
+        mat = Material()
+        mat.setShininess(128)
+        mat.setSpecular((0.9, 0.9, 0.95, 1))
+        mat.setMetallic(0.8)
+        mat.setRoughness(0.3)
+        mat.setAmbient(color)
+        mat.setDiffuse(color)
+        cylinder_np.setMaterial(mat)
+        
+        return cylinder_np
+        
+    def create_robotic_hand(self):
+        """Create smooth, human-like robotic hand with realistic proportions"""
+        
+        # Joint storage for both visual and position nodes
+        for i in range(21):
+            joint_container = self.render.attachNewNode(f"joint_{i}")
+            self.joint_nodes.append(joint_container)
+        
+        # Create smooth finger segments that follow human proportions
+        finger_definitions = [
+            # Each finger: (start_idx, segments, name)
+            (1, [(1, 2), (2, 3), (3, 4)], 'thumb'),
+            (5, [(5, 6), (6, 7), (7, 8)], 'index'),
+            (9, [(9, 10), (10, 11), (11, 12)], 'middle'),
+            (13, [(13, 14), (14, 15), (15, 16)], 'ring'),
+            (17, [(17, 18), (18, 19), (19, 20)], 'pinky'),
+        ]
+        
+        # Build each finger with smooth, rounded segments
+        for base_idx, segments, finger_name in finger_definitions:
+            for seg_idx, (idx1, idx2) in enumerate(segments):
+                # Create smooth finger segment
+                segment_node = self.render.attachNewNode(f"{finger_name}_seg_{seg_idx}")
+                
+                # Smooth gradient from dark to light (more human-like)
+                base_color = 0.16 + seg_idx * 0.02
+                color = (base_color, base_color + 0.01, base_color + 0.02, 1)
+                
+                # Main finger segment - smooth cylinder (more human-like)
+                phalanx = self.create_cylinder_bone(1.0, 0.16, color, segments=24)
+                phalanx.reparentTo(segment_node)
+                phalanx.setPos(0, 0, 0)
+                
+                # Rounded joint cover at base (smooth transition)
+                joint_cover = self.create_sphere_joint(
+                    radius=0.20,
+                    color=(base_color - 0.02, base_color - 0.01, base_color, 1),
+                    joint_type='normal'
+                )
+                joint_cover.reparentTo(segment_node)
+                joint_cover.setPos(0, 0, -0.05)
+                
+                # Small servo housing (minimal, smooth)
+                servo = self.create_box(0.12, 0.20, 0.25, (base_color + 0.02, base_color + 0.03, base_color + 0.04, 1))
+                servo.reparentTo(segment_node)
+                servo.setPos(0.18, 0, 0)
+                
+                # Subtle panel line
+                panel = self.create_box(0.30, 0.32, 0.02, (base_color - 0.04, base_color - 0.03, base_color - 0.02, 1))
+                panel.reparentTo(segment_node)
+                panel.setPos(0, 0, 0)
+                
+                self.bone_nodes.append((segment_node, (idx1, idx2)))
+        
+        # Smooth, contoured palm structure (human-like shape)
+        palm_connections = [(5, 9), (9, 13), (13, 17), (0, 5), (0, 17)]
+        
+        # Create smooth palm base
+        palm_base = self.render.attachNewNode("palm_base")
+        
+        # Main palm - smooth, rounded shape
+        main_palm = self.create_box(1.8, 1.6, 0.30, (0.15, 0.15, 0.17, 1))
+        main_palm.reparentTo(palm_base)
+        
+        # Smooth overlay layer (contoured)
+        overlay = self.create_box(1.6, 1.4, 0.25, (0.17, 0.17, 0.19, 1))
+        overlay.reparentTo(palm_base)
+        overlay.setPos(0, 0, 0.28)
+        
+        # Minimal structural lines (subtle)
+        for y_offset in [-0.5, 0, 0.5]:
+            line = self.create_box(1.7, 0.08, 0.20, (0.13, 0.13, 0.15, 1))
+            line.reparentTo(palm_base)
+            line.setPos(0, y_offset, 0.20)
+        
+        # Smooth side supports
+        for x_offset in [-0.7, 0.7]:
+            support = self.create_box(0.10, 1.5, 0.20, (0.13, 0.13, 0.15, 1))
+            support.reparentTo(palm_base)
+            support.setPos(x_offset, 0, 0.20)
+        
+        # Small detail spheres (minimal)
+        for x in [-0.6, 0, 0.6]:
+            for y in [-0.5, 0, 0.5]:
+                detail = self.create_sphere_joint(0.06, (0.19, 0.19, 0.21, 1))
+                detail.reparentTo(palm_base)
+                detail.setPos(x, y, 0.45)
+        
+        # Store palm base
+        self.bone_nodes.append((palm_base, (0, 9)))
+        
+        # Smooth connection mounts
+        for idx1, idx2 in palm_connections:
+            palm_segment = self.render.attachNewNode(f"palm_{idx1}_{idx2}")
+            
+            # Rounded mount
+            mount = self.create_sphere_joint(0.25, (0.16, 0.16, 0.18, 1))
+            mount.reparentTo(palm_segment)
+            
+            # Small cap
+            cap = self.create_box(0.30, 0.30, 0.12, (0.18, 0.18, 0.20, 1))
+            cap.reparentTo(palm_segment)
+            cap.setPos(0, 0, 0.18)
+            
+            self.bone_nodes.append((palm_segment, (idx1, idx2)))
+        
+        # Smooth, streamlined wrist assembly
+        wrist_assembly = self.render.attachNewNode("wrist_assembly")
+        
+        # Main wrist body - smooth and rounded
+        wrist_main = self.create_box(1.0, 0.9, 0.7, (0.14, 0.14, 0.16, 1))
+        wrist_main.reparentTo(wrist_assembly)
+        
+        # Smooth top and bottom caps
+        for z_offset in [-0.40, 0.40]:
+            cap = self.create_box(1.1, 1.0, 0.12, (0.16, 0.16, 0.18, 1))
+            cap.reparentTo(wrist_assembly)
+            cap.setPos(0, 0, z_offset)
+        
+        # Central bearing (smooth sphere)
+        bearing = self.create_sphere_joint(radius=0.30, color=(0.18, 0.18, 0.20, 1))
+        bearing.reparentTo(wrist_assembly)
+        
+        # Minimal side actuators (2 smooth cylinders)
+        for x_offset in [-0.50, 0.50]:
+            actuator = self.create_cylinder_bone(0.50, 0.12, (0.16, 0.16, 0.18, 1), segments=24)
+            actuator.reparentTo(wrist_assembly)
+            actuator.setPos(x_offset, 0, 0)
+            actuator.setH(90)
+        
+        # Small detail ring around bearing
+        ring = self.create_cylinder_bone(0.10, 0.35, (0.12, 0.12, 0.14, 1), segments=32)
+        ring.reparentTo(wrist_assembly)
+        ring.setH(90)
+        
+        # Attach wrist assembly
+        wrist_assembly.reparentTo(self.joint_nodes[0])
+        
+        # Minimal joint pins at key points (smooth, small)
+        key_joints = [5, 9, 13, 17]  # Finger bases only
+        for joint_idx in key_joints:
+            # Small smooth pin
+            pin = self.create_cylinder_bone(0.12, 0.08, (0.20, 0.20, 0.22, 1), segments=16)
+            pin.reparentTo(self.joint_nodes[joint_idx])
+            pin.setH(90)
+            
+    def create_grid(self):
+        """Create reference grid for depth perception"""
+        from panda3d.core import LineSegs
+        
+        grid = LineSegs()
+        grid.setThickness(2)
+        grid.setColor(0.3, 0.35, 0.4, 0.6)  # Brighter, more visible grid
+        
+        size = 30
+        step = 3
+        
+        # Grid lines on floor
+        for i in range(-size, size + 1, step):
+            grid.moveTo(i, -size, -5)
+            grid.drawTo(i, size, -5)
+            grid.moveTo(-size, i, -5)
+            grid.drawTo(size, i, -5)
+        
+        # Add center lines in different color for reference
+        grid.setColor(0.4, 0.5, 0.6, 0.8)
+        grid.setThickness(3)
+        grid.moveTo(-size, 0, -5)
+        grid.drawTo(size, 0, -5)
+        grid.moveTo(0, -size, -5)
+        grid.drawTo(0, size, -5)
+        
+        node = grid.create()
+        grid_np = self.render.attachNewNode(node)
+        grid_np.setTransparency(True)
+        
+    def smooth_position(self, current, previous, factor):
+        """Linear interpolation for smooth movement"""
+        if previous is None:
+            return current
+        return previous + (current - previous) * factor
+            
+    def update_hand(self, task):
+        """Update both hands based on MediaPipe landmarks with smoothing"""
+        
+        # Update LEFT hand (mirrored to appear on right side in VR perspective)
+        if self.hand_tracker.left_hand_landmarks:
+            landmarks = self.hand_tracker.left_hand_landmarks.landmark
+            scale = 20.0
+            x_offset = 12  # Offset to the right side
+            
+            for i, landmark in enumerate(landmarks):
+                # Mirror X coordinate for VR effect
+                x = (0.5 - landmark.x) * scale + x_offset  # Flipped X
+                y = (0.5 - landmark.z) * scale
+                z = (0.5 - landmark.y) * scale
+                
+                target_pos = (x, y, z)
+                
+                if self.left_prev_positions[i] is not None:
+                    prev = self.left_prev_positions[i]
+                    smoothed = (
+                        self.smooth_position(x, prev[0], self.smoothing_factor),
+                        self.smooth_position(y, prev[1], self.smoothing_factor),
+                        self.smooth_position(z, prev[2], self.smoothing_factor)
+                    )
+                    self.left_hand_joints[i].setPos(*smoothed)
+                    self.left_prev_positions[i] = smoothed
+                else:
+                    self.left_hand_joints[i].setPos(*target_pos)
+                    self.left_prev_positions[i] = target_pos
+            
+            # Update left hand bones
+            for bone, (idx1, idx2) in self.left_hand_bones:
+                pos1 = self.left_hand_joints[idx1].getPos()
+                pos2 = self.left_hand_joints[idx2].getPos()
+                
+                mid = (pos1 + pos2) / 2
+                bone.setPos(mid)
+                
+                direction = pos2 - pos1
+                length = direction.length()
+                
+                if length > 0.01:
+                    bone.setScale(1, 1, length)
+                    bone.lookAt(pos2)
+                    bone.setP(bone.getP() - 90)
+        
+        # Update RIGHT hand (mirrored to appear on left side in VR perspective)
+        if self.hand_tracker.right_hand_landmarks:
+            landmarks = self.hand_tracker.right_hand_landmarks.landmark
+            scale = 20.0
+            x_offset = -12  # Offset to the left side
+            
+            for i, landmark in enumerate(landmarks):
+                # Mirror X coordinate for VR effect
+                x = (0.5 - landmark.x) * scale + x_offset  # Flipped X
+                y = (0.5 - landmark.z) * scale
+                z = (0.5 - landmark.y) * scale
+                
+                target_pos = (x, y, z)
+                
+                if self.right_prev_positions[i] is not None:
+                    prev = self.right_prev_positions[i]
+                    smoothed = (
+                        self.smooth_position(x, prev[0], self.smoothing_factor),
+                        self.smooth_position(y, prev[1], self.smoothing_factor),
+                        self.smooth_position(z, prev[2], self.smoothing_factor)
+                    )
+                    self.right_hand_joints[i].setPos(*smoothed)
+                    self.right_prev_positions[i] = smoothed
+                else:
+                    self.right_hand_joints[i].setPos(*target_pos)
+                    self.right_prev_positions[i] = target_pos
+            
+            # Update right hand bones
+            for bone, (idx1, idx2) in self.right_hand_bones:
+                pos1 = self.right_hand_joints[idx1].getPos()
+                pos2 = self.right_hand_joints[idx2].getPos()
+                
+                mid = (pos1 + pos2) / 2
+                bone.setPos(mid)
+                
+                direction = pos2 - pos1
+                length = direction.length()
+                
+                if length > 0.01:
+                    bone.setScale(1, 1, length)
+                    bone.lookAt(pos2)
+                    bone.setP(bone.getP() - 90)
+                    
+        return Task.cont
+
+def main():
+    """Main application loop"""
+    # Initialize hand tracker
+    tracker = HandTracker()
+    
+    # OpenCV camera loop in separate thread
+    cap = cv2.VideoCapture(0)
+    camera_running = True
+    
+    def run_camera():
+        nonlocal camera_running
+        while camera_running and cap.isOpened():
+            ret, frame = cap.read()
+            if not ret:
+                break
+                
+            # Process frame with MediaPipe
+            tracker.process_frame(frame)
+            
+            # Flip for mirror effect
+            frame = cv2.flip(frame, 1)
+            
+            # Display
+            cv2.imshow('Hand Tracking', frame)
+            
+            if cv2.waitKey(1) & 0xFF == ord('q'):
+                camera_running = False
+                break
+    
+    # Start camera in thread
+    camera_thread = threading.Thread(target=run_camera, daemon=True)
+    camera_thread.start()
+    
+    # Run Panda3D in main thread (avoids signal handler issue)
+    
+    print("=== Robotic Hand Visualizer ===")
+    print("Press 'q' in camera window to quit")
+    print("Show your hand to the camera")
+    
+    try:
+        # Run Panda3D in main thread
+        app = RoboticHand3D(tracker)
+        app.run()
+    finally:
+        camera_running = False
+        camera_thread.join(timeout=2)
+        cap.release()
+        cv2.destroyAllWindows()
+
+if __name__ == "__main__":
+    main()
